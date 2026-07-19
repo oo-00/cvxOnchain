@@ -1,0 +1,7 @@
+{
+    "rpc": "https://ethereum-rpc.publicnode.com",
+    "batchLimit": 100,
+    "eventBlocksLimit": 10000,
+    "eventConcurrentLimit": 5,
+    "sleepTime": 500
+}
