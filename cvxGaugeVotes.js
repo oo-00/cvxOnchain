@@ -114,7 +114,7 @@ function currentEpoch(batched = false) {
 
 function currentProposalId(batched = false) {
     const epoch = currentEpoch();
-    const id = Math.floor((epoch - 228) / 2);
+    const id = Math.floor((epoch - 230) / 2);
     return batched ? staticValue(id) : id;
 }
 
