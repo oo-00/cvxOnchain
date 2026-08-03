@@ -1,3 +1,5 @@
 rebuildVote.js
 shots/
 mainnet.json
+GetMostUnsynced.js
+syncStat/*
