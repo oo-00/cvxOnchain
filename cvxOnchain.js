@@ -25,6 +25,9 @@
 
     const contracts = require('./contracts.js')(provider);
 
+    // Snapshot (off-chain) voting helper for partner platforms that use Snapshot.
+    const snapshot = require('./snapshot.js');
+
     // Multicall3 is deployed at the same address on virtually every EVM chain.
     const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11";
     const MULTICALL3_ABI = [
@@ -522,10 +525,38 @@
         return batched ? staticValue(weightsMap) : weightsMap;
     }
 
+    async function gaugeIsFinalized(platform = "Curve", proposalId = "current", batched = false) {
+        validatePlatform(platform, "gauge");
+        if(proposalId === "current") {
+            proposalId = await gaugeProposalId();
+        }
+        const contract = contracts[`${platform}GaugeVoting`];
+        const call = {
+            target: contract.address,
+            callData: contract.interface.encodeFunctionData('isFinalized', [proposalId]),
+            decode: (data) => contract.interface.decodeFunctionResult('isFinalized', data)[0]
+        };
+        return resolveCall(call, batched);
+    }
+
     async function prepareGaugeVoteTx(platform, gauges, weights, signer, voter) {
         validatePlatform(platform, "gauge");
         const tx = await contracts[`${platform}GaugeVoting`].connect(signer).populateTransaction.vote(voter, gauges, weights);
         return tx;
+    }
+
+    async function gaugeIsDone(platform = "Curve", proposalId = "current", batched = false) {
+        validatePlatform(platform, "gauge");
+        if(proposalId === "current") {
+            proposalId = await gaugeProposalId();
+        }
+        const contract = contracts[`${platform}GaugeExecutor`];
+        const call = {
+            target: contract.address,
+            callData: contract.interface.encodeFunctionData('isDone', [proposalId]),
+            decode: (data) => contract.interface.decodeFunctionResult('isDone', data)[0]
+        };
+        return resolveCall(call, batched);
     }
 
 // DAO VOTING FUNCTIONS
@@ -611,6 +642,201 @@
         return resolveCall(call, batched);
     }
 
+    async function daoIsFinished(platform = "Convex", proposalId, batched = false) {
+        validatePlatform(platform, "dao");
+        const contract = contracts[`${platform}DaoVoting`];
+        const call = {
+            target: contract.address,
+            callData: contract.interface.encodeFunctionData('isFinished', [proposalId]),
+            decode: (data) => contract.interface.decodeFunctionResult('isFinished', data)[0]
+        };
+        return resolveCall(call, batched);
+    }
+
+    async function daoIsFinalized(platform = "Convex", proposalId, batched = false) {
+        validatePlatform(platform, "dao");
+        const contract = contracts[`${platform}DaoVoting`];
+        const call = {
+            target: contract.address,
+            callData: contract.interface.encodeFunctionData('isFinalized', [proposalId]),
+            decode: (data) => contract.interface.decodeFunctionResult('isFinalized', data)[0]
+        };
+        return resolveCall(call, batched);
+    }
+
+    async function daoIsDone(platform = "Curve", proposalId, batched = false) {
+        if(platform !== "Curve" && platform !== "Resupply") {
+            throw new Error('Invalid platform. Must be "Curve" or "Resupply".');
+        }
+        const contract = contracts[`${platform}VoteExecutor`];
+        const call = {
+            target: contract.address,
+            callData: contract.interface.encodeFunctionData('isDone', [proposalId]),
+            decode: (data) => contract.interface.decodeFunctionResult('isDone', data)[0]
+        };
+        return resolveCall(call, batched);
+    }
+
+// PARTNER VOTING FUNCTIONS
+
+    const partnerDaoPlatforms = ["ResupplyVoter", "CurveOwnership", "CurveParameter", "fxn.eth", "frax.eth"];
+
+    async function partnerProposalCount(platform, batched = false) {
+        if(!partnerDaoPlatforms.includes(platform)) {
+            throw new Error(`Invalid platform. Must be one of: ${partnerDaoPlatforms.join(", ")}`);
+        }
+        const contract = contracts[platform];
+        if(platform === "CurveOwnership" || platform === "CurveParameter") {
+            const call = {
+                target: contract.address,
+                callData: contract.interface.encodeFunctionData('votesLength', []),
+                decode: (data) => toUnits(contract.interface.decodeFunctionResult('votesLength', data)[0], 0)
+            };
+            return resolveCall(call, batched);
+        }
+        if(platform === "ResupplyVoter") {
+            const call = {
+                target: contract.address,
+                callData: contract.interface.encodeFunctionData('getProposalCount', []),
+                decode: (data) => toUnits(contract.interface.decodeFunctionResult('getProposalCount', data)[0], 0)
+            };
+            return resolveCall(call, batched);
+        }
+        if(platform === "fxn.eth" || platform === "frax.eth") {
+            // use Math.floor of time / 6 hours to create a pseudo-proposal count that increments every 6 hours
+            // this way we check for new proposals every 6 hours and can use the snapshotGetNewProposals function to get the actual proposals
+            const now = Math.floor(Date.now() / 1000);
+            const proposalCount = Math.floor(now / (6 * 60 * 60));
+            return batched ? staticValue(proposalCount) : proposalCount;
+        }
+    }
+
+    async function partnerProposal(platform, proposalId, batched = false) {
+        if(!partnerDaoPlatforms.includes(platform)) {
+            throw new Error(`Invalid platform. Must be one of: ${partnerDaoPlatforms.join(", ")}`);
+        }
+        const contract = contracts[platform];
+        if(platform === "CurveOwnership" || platform === "CurveParameter") {
+            const call = {
+                target: contract.address,
+                callData: contract.interface.encodeFunctionData('getVote', [proposalId]),
+                decode: (data) => {
+                    const [open, executed, startDate, snapshotBlock, supportRequired, minAcceptQuorum, yea, nay, votingPower, script] = contract.interface.decodeFunctionResult('getVote', data);
+                    return { 
+                        start: toUnits(startDate, 0),
+                        voteType: platform === "CurveOwnership" ? 0 : 1,
+                        cvxId: null,
+                        script: script
+                    };
+                }
+            };
+            return resolveCall(call, batched);
+        } else if(platform === "ResupplyVoter") {
+            const call = {
+                target: contract.address,
+                callData: contract.interface.encodeFunctionData('getProposalData', [proposalId]),
+                decode: (data) => {
+                    const [description, epoch, createdAt, quorumWeight, weightYes,weightNo,processed,executable,payload] = contract.interface.decodeFunctionResult('getProposalData', data);
+                    return { 
+                        description,
+                        start: toUnits(createdAt, 0),
+                        voteType: 0,
+                        cvxId: null,
+                        payload
+                    };
+                }
+            };
+            return resolveCall(call, batched);
+        } else if(platform === "fxn.eth" || platform === "frax.eth") {
+            var proposals = await snapshot.getNewProposals(platform, proposalId);
+            var formattedProposals = {};
+            if(proposals.length == 0) {
+                return null;
+            } else {
+                for(var i = 0; i < proposals.length; i++) {
+                    // extract nativeId from title
+                    // examples 
+                    // '[FIP-30] Add FXN gauge to OUSD/fxUSD'
+                    // '[FIP - 446] Early withdrawal of stkcvxSTGFRAXBP and stkcvxCOILFRAXBP'
+                    // '[FIP- 446] Early withdrawal of stkcvxSTGFRAXBP and stkcvxCOILFRAXBP'
+                    // etc
+                    var title = proposals[i].title;
+                    var nativeId = title.match(/\[FIP[-\s]*(\d+)\]/);
+                    if(nativeId && nativeId.length > 1) {
+                        nativeId = parseInt(nativeId[1]);
+                    } else {
+                        nativeId = null;
+                    }
+                    formattedProposals[nativeId] = {
+                        snapshotId: proposals[i].id,
+                        description: proposals[i].title,
+                        start: proposals[i].start,
+                        voteType: 0,
+                        cvxId: null
+                    };
+                }
+            }
+            return formattedProposals;
+        } else {
+            throw new Error(`Invalid platform. Must be one of: ${partnerDaoPlatforms.join(", ")}`);
+        }
+    }
+
+    async function getCurveMetadata(proposalId, type, batched = false) {
+        // Metadata is only emitted in the event logs, so we need to query the logs for the proposalId
+        // event StartVote(uint256 indexed voteId, address indexed creator, string metadata, uint256 minBalance, uint256 minTime, uint256 totalSupply, uint256 creatorVotingPower);
+        // both vote types use identical contract abi, but different contract addresses, so we can use the same function to get metadata for both
+        var contract;
+        if(type == 0) {
+            contract = contracts.CurveOwnership;
+        } else if(type == 1) {
+            contract = contracts.CurveParameter;
+        } else {
+            throw new Error(`Invalid type. Must be one of: 0 (CurveOwnership), 1 (CurveParameter)`);
+        }
+        // use indexed event filter to get the StartVote event for the proposalId
+        // begin at latest block and search in batches of eventBlocksLimit blocks back until we find the event
+        // eventBlocksLimit and eventConcurrentLimit are already defined in the config
+        const latestBlock = await provider.getBlockNumber();
+        const filter = contract.filters.StartVote(proposalId);
+        var fromBlock = latestBlock - eventBlocksLimit;
+        if(fromBlock < 0) {
+            fromBlock = 0;
+        }
+        var toBlock = latestBlock;
+        var events = [];
+        while(fromBlock <= latestBlock) {
+            events = await contract.queryFilter(filter, fromBlock, toBlock);
+            if(events.length > 0) {
+                break;
+            }
+            fromBlock = Math.max(0, fromBlock - eventBlocksLimit);
+            toBlock = fromBlock + eventBlocksLimit - 1;
+        }
+        if(events.length == 0) {
+            throw new Error(`No StartVote event found for proposalId ${proposalId} in the last ${eventBlocksLimit} blocks`);
+        }
+        const metadata = events[0].args.metadata;
+        // check if metadata is ipfs:// or ipns:// and if so, fetch the metadata from ipfs
+        if(metadata.startsWith("ipfs:") || metadata.startsWith("ipns:")) {
+            console.log("Fetching metadata from IPFS for proposalId", proposalId);
+            var ipfsHash = metadata.split(":")[1];
+            // check if ipfsHash starts with // and remove it
+            if(ipfsHash.startsWith("//")) {
+                ipfsHash = ipfsHash.substring(2);
+            }
+            const ipfsUrl = `https://ipfs.io/ipfs/${ipfsHash}`;
+            const response = await fetch(ipfsUrl);
+            if(!response.ok) {
+                throw new Error(`Failed to fetch metadata from IPFS: ${response.status} ${response.statusText}`);
+            }
+            var ipfsMetadata = await response.json();
+            var metaText = ipfsMetadata.text;
+            return batched ? staticValue(metaText) : metaText;
+        }
+        return batched ? staticValue(metadata) : metadata;
+    }
+
 // EXPORTS
 
 module.exports = {
@@ -640,5 +866,17 @@ module.exports = {
     daoVoteTotal,
     daoUserVote,
     daoYesTotal,
-    daoNoTotal
+    daoNoTotal,
+    daoIsFinished,
+    daoIsFinalized,
+    daoIsDone,
+    gaugeIsFinalized,
+    gaugeIsDone,
+    partnerProposalCount,
+    partnerProposal,
+    validatePlatform,
+    snapshotGetNewProposals: snapshot.getNewProposals,
+    snapshotGetVote: snapshot.getVote,
+    snapshotHasVoted: snapshot.hasVoted,
+    getCurveMetadata
 };
