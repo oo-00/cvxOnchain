@@ -677,6 +677,61 @@
         return resolveCall(call, batched);
     }
 
+    async function daoVoterCount(platform = "Convex", proposalId, batched = false) {
+        validatePlatform(platform, "dao");
+        const contract = contracts[`${platform}DaoVoting`];
+        const call = {
+            target: contract.address,
+            callData: contract.interface.encodeFunctionData('getVoterCount', [proposalId]),
+            decode: (data) => contract.interface.decodeFunctionResult('getVoterCount', data)[0].toNumber()
+        };
+        return resolveCall(call, batched);
+    }
+
+    async function daoAllVoterAddresses(platform = "Convex", proposalId, batched = false) {
+        validatePlatform(platform, "dao");
+        const count = await daoVoterCount(platform, proposalId);
+        console.log(`Proposal ${proposalId} has ${count} voters on ${platform}`);
+        var groupedCalls = [];
+        for (let i = 0; i < count; i++) {
+            groupedCalls.push({
+                target: contracts[`${platform}DaoVoting`].address,
+                callData: contracts[`${platform}DaoVoting`].interface.encodeFunctionData('getVoterAtIndex', [proposalId, i]),
+                decode: (data) => contracts[`${platform}DaoVoting`].interface.decodeFunctionResult('getVoterAtIndex', data)[0]
+            });
+        }
+        // This can be dozens of calls, so always run it as its own self-contained
+        // multicall rather than injecting the leaves into a parent batch (which could
+        // exceed RPC limits and revert/deny). To the outer batchCall it looks like a
+        // precomputed static value that occupies a single slot.
+        const addresses = await batchCall(groupedCalls);
+        return batched ? staticValue(addresses) : addresses;
+    }
+
+    async function daoAllVotes(platform = "Convex", proposalId, batched = false) {
+        console.log(`Fetching all votes for proposal ${proposalId} on ${platform}`);
+        validatePlatform(platform, "dao");
+        const voterAddresses = await daoAllVoterAddresses(platform, proposalId);
+        const groupedCalls = voterAddresses.map(userAddress => ({
+            target: contracts[`${platform}DaoVoting`].address,
+            callData: contracts[`${platform}DaoVoting`].interface.encodeFunctionData('getVote', [proposalId, userAddress]),
+            decode: (data) => {
+                const [voted, yesWeight, noWeight, baseWeight, adjustedWeight] = contracts[`${platform}DaoVoting`].interface.decodeFunctionResult('getVote', data);
+                return {
+                    userAddress,
+                    voted,
+                    yesWeight: toUnits(yesWeight, 0),
+                    noWeight: toUnits(noWeight, 0),
+                    baseWeight: toUnits(baseWeight),
+                    adjustedWeight: toUnits(adjustedWeight)
+                };
+            }
+        }));
+        // This can be hundreds of calls, so always run it as its own self-contained multicall rather than injecting the leaves into a parent batch (which could exceed RPC limits and revert/deny). To the outer batchCall it looks like a precomputed static value that occupies a single slot.
+        const votes = await batchCall(groupedCalls);
+        return batched ? staticValue(votes) : votes;
+    }
+
 // PARTNER VOTING FUNCTIONS
 
     const partnerDaoPlatforms = ["ResupplyVoter", "CurveOwnership", "CurveParameter", "fxn.eth", "frax.eth"];
@@ -827,6 +882,7 @@
             }
             const ipfsUrl = `https://ipfs.io/ipfs/${ipfsHash}`;
             const response = await fetch(ipfsUrl);
+            await sleep(sleepTime); // sleep for a bit to avoid rate limiting
             if(!response.ok) {
                 throw new Error(`Failed to fetch metadata from IPFS: ${response.status} ${response.statusText}`);
             }
@@ -870,6 +926,10 @@ module.exports = {
     daoIsFinished,
     daoIsFinalized,
     daoIsDone,
+    daoVoterCount,
+    daoAllVoterAddresses,
+    daoAllVotes,
+    partnerDaoPlatforms,
     gaugeIsFinalized,
     gaugeIsDone,
     partnerProposalCount,
