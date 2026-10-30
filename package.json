@@ -13,7 +13,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "ethers": "^5.4.7"
+    "ethers": "^6.17.0"
   },
   "license": "MIT",
   "repository": "github:oo-00/cvxOnchain"

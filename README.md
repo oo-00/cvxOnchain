@@ -14,7 +14,7 @@ contracts (deposits, opt-out registries) are read by [votium.js](https://github.
 
 ```js
 const cvx = require('cvxonchain')({ rpc: process.env.RPC_URL });
-// or pass your own ethers v5 provider: require('cvxonchain')({ provider })
+// or pass your own ethers 6 provider: require('cvxonchain')({ provider })
 
 const proposalId = cvx.gaugeProposalId();
 const votes = await cvx.gaugeAllVotes('Curve', proposalId);
@@ -24,7 +24,7 @@ There's no settings file: options are passed in, and no RPC call is made until y
 
 | Option | Default | Meaning |
 |---|---|---|
-| `rpc` or `provider` | required | mainnet RPC URL, or an ethers v5 provider |
+| `rpc` or `provider` | required | mainnet RPC URL, or an ethers 6 provider |
 | `batchLimit` | 100 | max view calls per Multicall3 request |
 | `eventBlocksLimit` | 10000 | block range per log query |
 | `eventConcurrentLimit` | 5 | log queries in flight |
@@ -68,6 +68,9 @@ Before 1.0.0, cvxOnchain was a module configured by a tracked `settings.json`. N
 
 - `require('cvxonchain')` returns a function: call it with your options,
   `require('cvxonchain')({ rpc })`, and use what it returns as before.
+- It's built on ethers 6. A provider you pass, and `provider` and `contracts`, are ethers 6 objects,
+  and values read straight from `contracts` are `bigint`s, not BigNumbers. What the functions return
+  is unchanged: numbers, strings and plain objects.
 - `settings.json` is no longer tracked. If you edited yours, move it out of the repository before
   pulling (git won't overwrite it) and back afterwards, when it's ignored; an unedited one is
   removed. Pass its values as options instead (`demo.js` still reads one: copy

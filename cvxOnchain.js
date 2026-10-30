@@ -42,9 +42,9 @@ module.exports = function cvxOnchain(options = {}) {
         ? rawSleepTime
         : 0;
 
-    // Static, and told it's mainnet (the only chain these contracts are on): ethers' JsonRpcProvider asks the RPC for
-    // its chain id before almost every request, and without a network as soon as it's built
-    const provider = settings.provider || new ethers.providers.StaticJsonRpcProvider(settings.rpc, 1);
+    // Told it's mainnet (the only chain these contracts are on), so it never asks the RPC for its chain id, and
+    // doesn't retry forever at startup if the RPC is down
+    const provider = settings.provider || new ethers.JsonRpcProvider(settings.rpc, 1, { staticNetwork: true });
 
     const contracts = createContracts(provider);
 
@@ -54,6 +54,9 @@ module.exports = function cvxOnchain(options = {}) {
         "function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) view returns (tuple(bool success, bytes returnData)[] returnData)"
     ];
     const multicall = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider);
+
+    // the tx builders take a signer, a provider, or an address (a VoidSigner for it, as ethers 5's connect() made)
+    const runner = (signer) => (typeof signer === 'string' ? new ethers.VoidSigner(signer, provider) : signer);
 
     async function sleep(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
@@ -78,7 +81,7 @@ module.exports = function cvxOnchain(options = {}) {
     // the multicall it's batched in.
     function leafCall(contract, fn, args, decode = (result) => result, { allowFailure = false } = {}) {
         return {
-            target: contract.address,
+            target: contract.target,
             callData: contract.interface.encodeFunctionData(fn, args),
             decode: (data) => decode(contract.interface.decodeFunctionResult(fn, data)),
             allowFailure
@@ -119,7 +122,7 @@ module.exports = function cvxOnchain(options = {}) {
         const overrides = leaves.length > effectiveBatchLimit ? { blockTag: await provider.getBlockNumber() } : {};
         for (let i = 0; i < leaves.length; i += effectiveBatchLimit) {
             const chunk = leaves.slice(i, i + effectiveBatchLimit);
-            const chunkResults = await multicall.callStatic.aggregate3(
+            const chunkResults = await multicall.aggregate3.staticCall(
                 chunk.map(c => ({ target: c.target, allowFailure: !!c.allowFailure, callData: c.callData })),
                 overrides
             );
@@ -151,7 +154,7 @@ module.exports = function cvxOnchain(options = {}) {
     // Normalize a raw on-chain balance (BigNumber, in `decimals` base units) to a
     // human-readable number. Centralizing this keeps normalization consistent.
     function toUnits(value, decimals = 18) {
-        return Number(ethers.utils.formatUnits(value, decimals));
+        return Number(ethers.formatUnits(value, decimals));
     }
 
     function validatePlatform(platform, type) {
@@ -278,7 +281,7 @@ module.exports = function cvxOnchain(options = {}) {
             proposalId = await gaugeProposalId();
         }
         const contract = contracts[`${platform}GaugeVoting`];
-        const call = leafCall(contract, 'proposals', [proposalId]);
+        const call = leafCall(contract, 'proposals', [proposalId], ([startTime, endTime, epoch]) => Object.assign([Number(startTime), Number(endTime), Number(epoch)], { startTime: Number(startTime), endTime: Number(endTime), epoch: Number(epoch) }));
         return resolveCall(call, batched);
     }
 
@@ -335,7 +338,7 @@ module.exports = function cvxOnchain(options = {}) {
             proposalId = await gaugeProposalId();
         }
         const contract = contracts[`${platform}GaugeVoting`];
-        const call = leafCall(contract, 'getGaugeCount', [proposalId], (r) => r[0].toNumber());
+        const call = leafCall(contract, 'getGaugeCount', [proposalId], (r) => Number(r[0]));
         return resolveCall(call, batched);
     }
 
@@ -399,7 +402,7 @@ module.exports = function cvxOnchain(options = {}) {
             proposalId = await gaugeProposalId();
         }
         const contract = contracts[`${platform}GaugeVoting`];
-        const call = leafCall(contract, 'getVoterCount', [proposalId], (r) => r[0].toNumber());
+        const call = leafCall(contract, 'getVoterCount', [proposalId], (r) => Number(r[0]));
         return resolveCall(call, batched);
     }
 
@@ -454,9 +457,9 @@ module.exports = function cvxOnchain(options = {}) {
     async function getContributingWeights(platform = "Curve", proposalId = "current", delegate, users, batched = false) {
         validatePlatform(platform, "gauge");
         if(platform === "Curve") {
-            platform = contracts.CurveGaugeVoting.address;
+            platform = contracts.CurveGaugeVoting.target;
         } else if(platform === "Fx") {
-            platform = contracts.FxGaugeVoting.address;
+            platform = contracts.FxGaugeVoting.target;
         }
         if(proposalId === "current") {
             proposalId = await gaugeProposalId();
@@ -494,7 +497,7 @@ module.exports = function cvxOnchain(options = {}) {
 
     async function prepareGaugeVoteTx(platform, gauges, weights, signer, voter) {
         validatePlatform(platform, "gauge");
-        const tx = await contracts[`${platform}GaugeVoting`].connect(signer).populateTransaction.vote(voter, gauges, weights);
+        const tx = await contracts[`${platform}GaugeVoting`].connect(runner(signer)).vote.populateTransaction(voter, gauges, weights);
         return tx;
     }
 
@@ -513,7 +516,7 @@ module.exports = function cvxOnchain(options = {}) {
     async function daoProposalCount(platform = "Convex", batched = false) {
         validatePlatform(platform, "dao");
         const contract = contracts[`${platform}DaoVoting`];
-        const call = leafCall(contract, 'proposalCount', [], (r) => r[0].toNumber());
+        const call = leafCall(contract, 'proposalCount', [], (r) => Number(r[0]));
         return resolveCall(call, batched);
     }
 
@@ -521,10 +524,10 @@ module.exports = function cvxOnchain(options = {}) {
         validatePlatform(platform, "dao");
         const contract = contracts[`${platform}DaoVoting`];
         const call = leafCall(contract, 'proposals', [proposalId], ([startTime, endTime, epoch, voteType, nativeId]) => ({
-            startTime,
-            endTime,
-            epoch,
-            voteType,
+            startTime: Number(startTime),
+            endTime: Number(endTime),
+            epoch: Number(epoch),
+            voteType: Number(voteType),
             nativeId: toUnits(nativeId, 0)
         }));
         return resolveCall(call, batched);
@@ -593,7 +596,7 @@ module.exports = function cvxOnchain(options = {}) {
     async function daoVoterCount(platform = "Convex", proposalId, batched = false) {
         validatePlatform(platform, "dao");
         const contract = contracts[`${platform}DaoVoting`];
-        const call = leafCall(contract, 'getVoterCount', [proposalId], (r) => r[0].toNumber());
+        const call = leafCall(contract, 'getVoterCount', [proposalId], (r) => Number(r[0]));
         return resolveCall(call, batched);
     }
 
@@ -722,7 +725,7 @@ module.exports = function cvxOnchain(options = {}) {
         // The vote's record says where its StartVote event is: Aragon voting sets snapshotBlock to the block before
         // the one that creates the vote. getVote reverts (VOTING_NO_VOTE) for a vote that doesn't exist.
         const [snapshotBlock] = await batchCall([
-            leafCall(contract, 'getVote', [proposalId], (r) => r.snapshotBlock.toNumber(), { allowFailure: true })
+            leafCall(contract, 'getVote', [proposalId], (r) => Number(r.snapshotBlock), { allowFailure: true })
         ]);
         if(snapshotBlock === null) {
             throw new Error(`No vote ${proposalId} on ${type == 0 ? "CurveOwnership" : "CurveParameter"}`);
@@ -777,7 +780,7 @@ module.exports = function cvxOnchain(options = {}) {
             baseWeight: toUnits(r.baseWeight),
             adjustedWeight: toUnits(r.adjustedWeight),
             lastVoteSyncNonce: Number(r.lastVoteSyncNonce),
-            voteStatus: r.voteStatus,
+            voteStatus: Number(r.voteStatus),
             delegate: r.delegate,
             totalDelegationWeight: toUnits(r.totalDelegationWeight)
         }));
@@ -801,7 +804,7 @@ module.exports = function cvxOnchain(options = {}) {
             leafCall(contracts[`${platform}GaugeVoting`], 'pendingWeightAdjustment', [proposalId, userAddress], (r) => toUnits(r[0]))
         ]);
         var weight;
-        if (info.delegate == ethers.constants.AddressZero) {
+        if (info.delegate == ethers.ZeroAddress) {
             weight = { baseWeight: base, adjustedWeight: info.adjustedWeight + delegated };
         } else if (info.voteStatus > 0) {
             weight = { baseWeight: base, adjustedWeight: info.adjustedWeight + delegated - info.totalDelegationWeight + pending };
@@ -831,11 +834,11 @@ module.exports = function cvxOnchain(options = {}) {
         const calls = users.map(user => groupCalls([
             leafCall(delegation, 'getDelegateAtEpoch', [user, epoch], (r) => r[0]),
             leafCall(delegation, 'userWeightAtEpochOf', [epoch, user], (r) => toUnits(r[0])),
-            leafCall(delegation, 'getSyncSnapshot', [user, epoch], (r) => ({ preSyncWeight: toUnits(r.preSyncWeight), snapNonce: r.snapshotNonce.toNumber() })),
+            leafCall(delegation, 'getSyncSnapshot', [user, epoch], (r) => ({ preSyncWeight: toUnits(r.preSyncWeight), snapNonce: Number(r.snapshotNonce) })),
             leafCall(voting, 'userInfo', [proposalId, user], (r) => ({ voteStatus: r.voteStatus, lastVoteSyncNonce: Number(r.lastVoteSyncNonce) }))
         ]));
         if (delegateVote == null) {
-            calls.push(leafCall(delegation, 'syncNonce', [], (r) => r[0].toNumber()));
+            calls.push(leafCall(delegation, 'syncNonce', [], (r) => Number(r[0])));
         }
         const perUser = await batchCall(calls);
         if (delegateVote == null) {
@@ -888,7 +891,7 @@ module.exports = function cvxOnchain(options = {}) {
     async function prepareSetGaugeTx(platform, gauge, signer) {
         validatePlatform(platform, "gauge");
         // setGauge is overloaded (gauge id / gauge address), so name the signature explicitly.
-        const tx = await contracts[`${platform}GaugeRegistry`].connect(signer).populateTransaction["setGauge(address)"](gauge);
+        const tx = await contracts[`${platform}GaugeRegistry`].connect(runner(signer))["setGauge(address)"].populateTransaction(gauge);
         return tx;
     }
 

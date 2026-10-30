@@ -29,19 +29,18 @@ if (block !== null && !(Number.isInteger(block) && block > 0)) {
 }
 
 // every eth_call at the pinned block, if one is given, and that block as the latest one, so getAllLockedUsers scans
-// the 20 weeks before it
-class Pinned extends ethers.providers.StaticJsonRpcProvider {
-    send(method, params) {
-        if (block && method === 'eth_blockNumber') {
-            return Promise.resolve('0x' + block.toString(16));
-        }
-        if (block && method === 'eth_call' && (params[1] === 'latest' || params[1] === undefined)) {
-            params = [params[0], '0x' + block.toString(16)];
-        }
-        return super.send(method, params);
+// the 20 weeks before it. ethers 6 sends requests in batches, so each request in a batch is rewritten.
+class Pinned extends ethers.JsonRpcProvider {
+    _send(payload) {
+        const at = '0x' + block.toString(16);
+        const list = (Array.isArray(payload) ? payload : [payload]).map((p) =>
+            (p.method === 'eth_call' && (p.params[1] === 'latest' || p.params[1] === undefined) ? { ...p, params: [p.params[0], at] } : p));
+        const latest = list.filter((p) => p.method === 'eth_blockNumber');
+        const rest = list.filter((p) => p.method !== 'eth_blockNumber');
+        return (rest.length ? super._send(rest) : Promise.resolve([])).then((out) => [...out, ...latest.map((p) => ({ id: p.id, result: at }))]);
     }
 }
-const cvx = require('../cvxOnchain.js')({ provider: new Pinned(rpc, 1) });
+const cvx = require('../cvxOnchain.js')({ provider: block ? new Pinned(rpc, 1, { staticNetwork: true }) : new ethers.JsonRpcProvider(rpc, 1, { staticNetwork: true }) });
 const delegate = flag('--delegate') || '0xde1E6A7ED0ad3F61D531a8a78E83CcDdbd6E0c49';
 const same = (a, b) => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(a), Math.abs(b));
 
@@ -55,7 +54,7 @@ const same = (a, b) => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(a), Math.a
         // the latest proposal at the block (the wall clock's "current" one may not exist yet there)
         const proposal = flag('--proposal') !== null
             ? Number(flag('--proposal'))
-            : (await cvx.contracts[`${platform}GaugeVoting`].proposalCount()).toNumber() - 1;
+            : (await cvx.contracts[`${platform}GaugeVoting`].proposalCount()) - 1n;
         const epoch = (await cvx.gaugeProposals(platform, proposal)).epoch;
         let list = users;
         if (!list) {
