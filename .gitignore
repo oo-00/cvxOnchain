@@ -3,3 +3,5 @@ shots/
 mainnet.json
 GetMostUnsynced.js
 syncStat/*
+node_modules/
+settings.json

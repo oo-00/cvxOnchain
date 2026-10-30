@@ -1,6 +1,28 @@
+// cvxOnchain: reads (and unsigned tx builders) for Convex's on-chain vlCVX voting.
+//
+//   const cvx = require('cvxonchain')({ rpc: 'https://...' });   // or ({ provider })
+//
+// Options: rpc or provider (required), batchLimit, eventBlocksLimit, eventConcurrentLimit,
+// sleepTime. There's no settings file, and no RPC is made until a function is called.
+
+const ethers = require('ethers');
+const createContracts = require('./contracts.js');
+// Snapshot (off-chain) voting helper for partner platforms that use Snapshot.
+const snapshot = require('./snapshot.js');
+
+const DEFAULTS = { batchLimit: 100, eventBlocksLimit: 10000, eventConcurrentLimit: 5, sleepTime: 500 };
+
+module.exports = function cvxOnchain(options = {}) {
+
 // SETUP 
-    const settings = require('./settings.json');
-    const rpc = settings.rpc;
+    // options passed as undefined (an unset environment variable, say) keep their defaults
+    const settings = { ...DEFAULTS };
+    for (const [key, value] of Object.entries(options || {})) {
+        if (value !== undefined) settings[key] = value;
+    }
+    if (!settings.provider && !settings.rpc) {
+        throw new Error('cvxOnchain: pass { rpc } or { provider }');
+    }
 
     // Max leaf calls per multicall RPC. A user may set 0 (or leave it blank/invalid)
     // expecting "no limit", so treat anything that isn't a positive integer as
@@ -20,13 +42,11 @@
         ? rawSleepTime
         : 0;
 
-    const ethers = require('ethers');
-    const provider = new ethers.providers.JsonRpcProvider(rpc);
+    // Static, and told it's mainnet (the only chain these contracts are on): ethers' JsonRpcProvider asks the RPC for
+    // its chain id before almost every request, and without a network as soon as it's built
+    const provider = settings.provider || new ethers.providers.StaticJsonRpcProvider(settings.rpc, 1);
 
-    const contracts = require('./contracts.js')(provider);
-
-    // Snapshot (off-chain) voting helper for partner platforms that use Snapshot.
-    const snapshot = require('./snapshot.js');
+    const contracts = createContracts(provider);
 
     // Multicall3 is deployed at the same address on virtually every EVM chain.
     const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11";
@@ -42,13 +62,27 @@
 // BATCHING FUNCTIONS
 
     // An entry passed to batchCall is either:
-    //   - a leaf descriptor { target, callData, decode }, or
+    //   - a leaf descriptor { target, callData, decode, allowFailure? } (leafCall builds one): with
+    //     allowFailure, a call that reverts, or returns nothing (an address with no code, say),
+    //     yields null instead of failing the whole multicall, or
     //   - a composite { calls: [leaf...], combine } that expands into multiple leaves
     //     and recombines their decoded results into one value.
     // groupCalls builds a composite so a single abstracted function (e.g. one that needs
     // two on-chain reads) still counts as ONE logical entry in a batch.
     function groupCalls(calls, combine = (results) => results) {
         return { calls, combine };
+    }
+
+    // A leaf descriptor for one view call: encodes fn(args) on contract, decodes with `decode`.
+    // allowFailure: a revert, or an empty result (no code at the target), yields null rather than failing
+    // the multicall it's batched in.
+    function leafCall(contract, fn, args, decode = (result) => result, { allowFailure = false } = {}) {
+        return {
+            target: contract.address,
+            callData: contract.interface.encodeFunctionData(fn, args),
+            decode: (data) => decode(contract.interface.decodeFunctionResult(fn, data)),
+            allowFailure
+        };
     }
 
     // Given a call (leaf or composite), either return it (batched) or execute it now.
@@ -77,20 +111,27 @@
 
         // Chunk leaves into batchLimit-sized multicalls so a huge batch doesn't exceed
         // RPC limits. Multiple chunks run sequentially with a sleepTime pause between
-        // them to avoid rate limiting.
+        // them to avoid rate limiting, all at the same block, so the batch reads one
+        // block's state. (A provider that pins reads to a block should answer
+        // eth_blockNumber with that block too.)
         const results = [];
         const effectiveBatchLimit = limitOverride !== null ? normalizeBatchLimit(limitOverride) : batchLimit;
+        const overrides = leaves.length > effectiveBatchLimit ? { blockTag: await provider.getBlockNumber() } : {};
         for (let i = 0; i < leaves.length; i += effectiveBatchLimit) {
             const chunk = leaves.slice(i, i + effectiveBatchLimit);
             const chunkResults = await multicall.callStatic.aggregate3(
-                chunk.map(c => ({ target: c.target, allowFailure: false, callData: c.callData }))
+                chunk.map(c => ({ target: c.target, allowFailure: !!c.allowFailure, callData: c.callData })),
+                overrides
             );
             results.push(...chunkResults);
             if (i + effectiveBatchLimit < leaves.length) {
                 await sleep(sleepTime);
             }
         }
-        const decoded = results.map((r, i) => leaves[i].decode(r.returnData));
+        // only allowFailure leaves can come back unsuccessful or empty; anything else that won't decode throws
+        const decoded = results.map((r, i) => (!r.success || (leaves[i].allowFailure && r.returnData === '0x')
+            ? null
+            : leaves[i].decode(r.returnData)));
 
         return plans.map(p => {
             const slice = decoded.slice(p.start, p.start + p.count);
@@ -206,16 +247,8 @@
         }
         // Two on-chain reads combined into one logical value: [basePower, delegatedPower]
         const call = groupCalls([
-            {
-                target: contracts.vlCVX.address,
-                callData: contracts.vlCVX.interface.encodeFunctionData('balanceAtEpochOf', [epoch, userAddress]),
-                decode: (data) => toUnits(contracts.vlCVX.interface.decodeFunctionResult('balanceAtEpochOf', data)[0])
-            },
-            {
-                target: contracts.GaugeDelegation.address,
-                callData: contracts.GaugeDelegation.interface.encodeFunctionData('balanceAtEpochOf', [epoch, userAddress]),
-                decode: (data) => toUnits(contracts.GaugeDelegation.interface.decodeFunctionResult('balanceAtEpochOf', data)[0])
-            }
+            leafCall(contracts.vlCVX, 'balanceAtEpochOf', [epoch, userAddress], (r) => toUnits(r[0])),
+            leafCall(contracts.GaugeDelegation, 'balanceAtEpochOf', [epoch, userAddress], (r) => toUnits(r[0]))
         ]);
         return resolveCall(call, batched);
     }
@@ -225,11 +258,7 @@
         if(epoch === "current") {
             epoch = await currentEpoch();
         }
-        const groupedCalls = userArray.map(userAddress => ({
-            target: contracts.vlCVX.address,
-            callData: contracts.vlCVX.interface.encodeFunctionData('balanceAtEpochOf', [epoch, userAddress]),
-            decode: (data) => toUnits(contracts.vlCVX.interface.decodeFunctionResult('balanceAtEpochOf', data)[0])
-        }));
+        const groupedCalls = userArray.map(userAddress => leafCall(contracts.vlCVX, 'balanceAtEpochOf', [epoch, userAddress], (r) => toUnits(r[0])));
         // This can be hundreds of calls, so always run it as its own self-contained
         // multicall rather than injecting the leaves into a parent batch (which could
         // exceed RPC limits and revert/deny). To the outer batchCall it looks like a
@@ -249,11 +278,7 @@
             proposalId = await gaugeProposalId();
         }
         const contract = contracts[`${platform}GaugeVoting`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('proposals', [proposalId]),
-            decode: (data) => contract.interface.decodeFunctionResult('proposals', data)
-        };
+        const call = leafCall(contract, 'proposals', [proposalId]);
         return resolveCall(call, batched);
     }
 
@@ -262,16 +287,8 @@
         var futureEpoch = epoch + 2;
 
         const call = groupCalls([
-            {
-                target: contracts.GaugeDelegation.address,
-                callData: contracts.GaugeDelegation.interface.encodeFunctionData('getDelegateAtEpoch', [userAddress, epoch]),
-                decode: (data) => contracts.GaugeDelegation.interface.decodeFunctionResult('getDelegateAtEpoch', data)[0]
-            },
-            {
-                target: contracts.GaugeDelegation.address,
-                callData: contracts.GaugeDelegation.interface.encodeFunctionData('getDelegateAtEpoch', [userAddress, futureEpoch]),
-                decode: (data) => contracts.GaugeDelegation.interface.decodeFunctionResult('getDelegateAtEpoch', data)[0]
-            }
+            leafCall(contracts.GaugeDelegation, 'getDelegateAtEpoch', [userAddress, epoch], (r) => r[0]),
+            leafCall(contracts.GaugeDelegation, 'getDelegateAtEpoch', [userAddress, futureEpoch], (r) => r[0])
         ], (results) => ([
             results[0],
             results[1]
@@ -283,11 +300,7 @@
         if(epoch === "current") {
             epoch = await currentEpoch();
         }
-        const groupedCalls = userArray.map(userAddress => ({
-            target: contracts.GaugeDelegation.address,
-            callData: contracts.GaugeDelegation.interface.encodeFunctionData('getDelegateAtEpoch', [userAddress, epoch]),
-            decode: (data) => contracts.GaugeDelegation.interface.decodeFunctionResult('getDelegateAtEpoch', data)[0]
-        }));
+        const groupedCalls = userArray.map(userAddress => leafCall(contracts.GaugeDelegation, 'getDelegateAtEpoch', [userAddress, epoch], (r) => r[0]));
         // This can be hundreds of calls, so always run it as its own self-contained
         // multicall rather than injecting the leaves into a parent batch (which could
         // exceed RPC limits and revert/deny). To the outer batchCall it looks like a
@@ -302,11 +315,7 @@
 
     async function gaugeSyncedWeight(userAddress, batched = false) {
         const contract = contracts.GaugeDelegation;
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('getUserWeight', [userAddress]),
-            decode: (data) => toUnits(contract.interface.decodeFunctionResult('getUserWeight', data)[0])
-        };
+        const call = leafCall(contract, 'getUserWeight', [userAddress], (r) => toUnits(r[0]));
         return resolveCall(call, batched);
     }
 
@@ -316,11 +325,7 @@
             proposalId = await gaugeProposalId();
         }
         const contract = contracts[`${platform}GaugeVoting`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('voteTotals', [proposalId]),
-            decode: (data) => toUnits(contract.interface.decodeFunctionResult('voteTotals', data)[0])
-        };
+        const call = leafCall(contract, 'voteTotals', [proposalId], (r) => toUnits(r[0]));
         return resolveCall(call, batched);
     }
 
@@ -330,13 +335,12 @@
             proposalId = await gaugeProposalId();
         }
         const contract = contracts[`${platform}GaugeVoting`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('getGaugeCount', [proposalId]),
-            decode: (data) => contract.interface.decodeFunctionResult('getGaugeCount', data)[0].toNumber()
-        };
+        const call = leafCall(contract, 'getGaugeCount', [proposalId], (r) => r[0].toNumber());
         return resolveCall(call, batched);
     }
+
+    // GaugeVoting.getGaugeEntry, decoded: [gauge, totalWeight]
+    const decodeGaugeEntry = ([gauge, totalWeight]) => [gauge, toUnits(totalWeight)];
 
     async function getGaugeEntry(platform = "Curve", proposalId = "current", index, batched = false) {
         validatePlatform(platform, "gauge");
@@ -344,14 +348,7 @@
             proposalId = await gaugeProposalId();
         }
         const contract = contracts[`${platform}GaugeVoting`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('getGaugeEntry', [proposalId, index]),
-            decode: (data) => {
-                const [gauge, totalWeight] = contract.interface.decodeFunctionResult('getGaugeEntry', data);
-                return [gauge, toUnits(totalWeight)];
-            }
-        };
+        const call = leafCall(contract, 'getGaugeEntry', [proposalId, index], decodeGaugeEntry);
         return resolveCall(call, batched);
     }
 
@@ -363,14 +360,7 @@
         const count = await getGaugeCount(platform, proposalId);
         var groupedCalls = [];
         for (let i = 0; i < count; i++) {
-            groupedCalls.push({
-                target: contracts[`${platform}GaugeVoting`].address,
-                callData: contracts[`${platform}GaugeVoting`].interface.encodeFunctionData('getGaugeEntry', [proposalId, i]),
-                decode: (data) => {
-                    const [gauge, totalWeight] = contracts[`${platform}GaugeVoting`].interface.decodeFunctionResult('getGaugeEntry', data);
-                    return [gauge, toUnits(totalWeight)];
-                }
-            });
+            groupedCalls.push(leafCall(contracts[`${platform}GaugeVoting`], 'getGaugeEntry', [proposalId, i], decodeGaugeEntry));
         }
         // map results from [ [gauge, weight], ... ] to { gauge: weight, ... }
         const call = groupCalls(groupedCalls, (results) => {
@@ -390,11 +380,7 @@
         }
         const contract = contracts[`${platform}GaugeVoting`];
         // gaugeTotal takes proposalId and gauge address, so we need to make a call for each gauge
-        const groupedCalls = gauges.map(gauge => ({
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('gaugeTotal', [proposalId, gauge]),
-            decode: (data) => toUnits(contract.interface.decodeFunctionResult('gaugeTotal', data)[0])
-        }));
+        const groupedCalls = gauges.map(gauge => leafCall(contract, 'gaugeTotal', [proposalId, gauge], (r) => toUnits(r[0])));
         // This can be dozens of calls, so always run it as its own self-contained
         // multicall rather than injecting the leaves into a parent batch (which could
         // exceed RPC limits and revert/deny). To the outer batchCall it looks like a
@@ -413,11 +399,7 @@
             proposalId = await gaugeProposalId();
         }
         const contract = contracts[`${platform}GaugeVoting`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('getVoterCount', [proposalId]),
-            decode: (data) => contract.interface.decodeFunctionResult('getVoterCount', data)[0].toNumber()
-        };
+        const call = leafCall(contract, 'getVoterCount', [proposalId], (r) => r[0].toNumber());
         return resolveCall(call, batched);
     }
 
@@ -429,11 +411,7 @@
         const count = await gaugeVoterCount(platform, proposalId);
         var groupedCalls = [];
         for (let i = 0; i < count; i++) {
-            groupedCalls.push({
-                target: contracts[`${platform}GaugeVoting`].address,
-                callData: contracts[`${platform}GaugeVoting`].interface.encodeFunctionData('getVoterAtIndex', [proposalId, i]),
-                decode: (data) => contracts[`${platform}GaugeVoting`].interface.decodeFunctionResult('getVoterAtIndex', data)[0]
-            });
+            groupedCalls.push(leafCall(contracts[`${platform}GaugeVoting`], 'getVoterAtIndex', [proposalId, i], (r) => r[0]));
         }
         // This can be dozens of calls, so always run it as its own self-contained
         // multicall rather than injecting the leaves into a parent batch (which could
@@ -443,26 +421,21 @@
         return batched ? staticValue(addresses) : addresses;
     }
 
+    // GaugeVoting.getVote, decoded
+    const decodeGaugeVote = ([gauges, weights, voted, baseWeight, adjustedWeight]) => ({
+        gauges,
+        weights: weights.map(w => toUnits(w, 0)),
+        voted,
+        baseWeight: toUnits(baseWeight),
+        adjustedWeight: toUnits(adjustedWeight)
+    });
+
     async function gaugeUserVote(platform = "Curve", proposalId = "current", userAddress, batched = false) {
         validatePlatform(platform, "gauge");
         if(proposalId === "current") {
             proposalId = await gaugeProposalId();
         }
-        const contract = contracts[`${platform}GaugeVoting`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('getVote', [proposalId, userAddress]),
-            decode: (data) => {
-                const [gauges, weights, voted, baseWeight, adjustedWeight] = contract.interface.decodeFunctionResult('getVote', data);
-                return {
-                    gauges,
-                    weights: weights.map(w => toUnits(w, 0)),
-                    voted,
-                    baseWeight: toUnits(baseWeight),
-                    adjustedWeight: toUnits(adjustedWeight)
-                };
-            }
-        };
+        const call = leafCall(contracts[`${platform}GaugeVoting`], 'getVote', [proposalId, userAddress], decodeGaugeVote);
         return resolveCall(call, batched);
     }
 
@@ -472,21 +445,7 @@
             proposalId = await gaugeProposalId();
         }
         const voterAddresses = await gaugeAllVoterAddresses(platform, proposalId);
-        const groupedCalls = voterAddresses.map(userAddress => ({
-            target: contracts[`${platform}GaugeVoting`].address,
-            callData: contracts[`${platform}GaugeVoting`].interface.encodeFunctionData('getVote', [proposalId, userAddress]),
-            decode: (data) => {
-                const [gauges, weights, voted, baseWeight, adjustedWeight] = contracts[`${platform}GaugeVoting`].interface.decodeFunctionResult('getVote', data);
-                return {
-                    userAddress,
-                    gauges,
-                    weights: weights.map(w => toUnits(w, 0)),
-                    voted,
-                    baseWeight: toUnits(baseWeight),
-                    adjustedWeight: toUnits(adjustedWeight)
-                };
-            }
-        }));
+        const groupedCalls = voterAddresses.map(userAddress => leafCall(contracts[`${platform}GaugeVoting`], 'getVote', [proposalId, userAddress], (r) => ({ userAddress, ...decodeGaugeVote(r) })));
         // This can be hundreds of calls, so always run it as its own self-contained multicall rather than injecting the leaves into a parent batch (which could exceed RPC limits and revert/deny). To the outer batchCall it looks like a precomputed static value that occupies a single slot.
         const votes = await batchCall(groupedCalls);
         return batched ? staticValue(votes) : votes;
@@ -507,14 +466,12 @@
         const groupedCalls = [];
         for (let i = 0; i < users.length; i += batchLimit) {
             const userBatch = users.slice(i, i + batchLimit);
-            groupedCalls.push({
-                target: contracts.GaugeVoteHelper.address,
-                callData: contracts.GaugeVoteHelper.interface.encodeFunctionData('getContributingWeights', [proposalId, delegate, userBatch, platform]),
-                decode: (data) => contracts.GaugeVoteHelper.interface.decodeFunctionResult('getContributingWeights', data)[0].map(w => toUnits(w))
-            });
+            groupedCalls.push(leafCall(contracts.GaugeVoteHelper, 'getContributingWeights', [proposalId, delegate, userBatch, platform], (r) => r[0].map(w => toUnits(w))));
         }
-        // This can be hundreds of calls, so always run it as its own self-contained multicall rather than injecting the leaves into a parent batch (which could exceed RPC limits and revert/deny). To the outer batchCall it looks like a precomputed static value that occupies a single slot.
-        const weightsBatches = await batchCall(groupedCalls);
+        // Run as its own multicalls, one helper call (batchLimit users) per request: packing batchLimit of them into one
+        // multicall would put batchLimit² users in a single eth_call, past the RPC's gas cap for a large delegate.
+        // To the outer batchCall it looks like a precomputed static value that occupies a single slot.
+        const weightsBatches = await batchCall(groupedCalls, 1);
         // flatten the array of arrays into a single array
         const weights = weightsBatches.flat();
         // return an object with user addresses as keys and weights as values
@@ -531,11 +488,7 @@
             proposalId = await gaugeProposalId();
         }
         const contract = contracts[`${platform}GaugeVoting`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('isFinalized', [proposalId]),
-            decode: (data) => contract.interface.decodeFunctionResult('isFinalized', data)[0]
-        };
+        const call = leafCall(contract, 'isFinalized', [proposalId], (r) => r[0]);
         return resolveCall(call, batched);
     }
 
@@ -551,11 +504,7 @@
             proposalId = await gaugeProposalId();
         }
         const contract = contracts[`${platform}GaugeExecutor`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('isDone', [proposalId]),
-            decode: (data) => contract.interface.decodeFunctionResult('isDone', data)[0]
-        };
+        const call = leafCall(contract, 'isDone', [proposalId], (r) => r[0]);
         return resolveCall(call, batched);
     }
 
@@ -564,103 +513,71 @@
     async function daoProposalCount(platform = "Convex", batched = false) {
         validatePlatform(platform, "dao");
         const contract = contracts[`${platform}DaoVoting`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('proposalCount', []),
-            decode: (data) => contract.interface.decodeFunctionResult('proposalCount', data)[0].toNumber()
-        };
+        const call = leafCall(contract, 'proposalCount', [], (r) => r[0].toNumber());
         return resolveCall(call, batched);
     }
 
     async function daoProposal(platform = "Convex", proposalId, batched = false) {
         validatePlatform(platform, "dao");
         const contract = contracts[`${platform}DaoVoting`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('proposals', [proposalId]),
-            decode: (data) => {
-                const [startTime, endTime, epoch, voteType, nativeId] = contract.interface.decodeFunctionResult('proposals', data);
-                return {
-                    startTime,
-                    endTime,
-                    epoch,
-                    voteType,
-                    nativeId: toUnits(nativeId, 0)
-                };
-            }
-        };
+        const call = leafCall(contract, 'proposals', [proposalId], ([startTime, endTime, epoch, voteType, nativeId]) => ({
+            startTime,
+            endTime,
+            epoch,
+            voteType,
+            nativeId: toUnits(nativeId, 0)
+        }));
         return resolveCall(call, batched);
     }
 
     async function daoVoteTotal(platform = "Convex", proposalId, batched = false) {
         validatePlatform(platform, "dao");
         const contract = contracts[`${platform}DaoVoting`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('voteTotals', [proposalId]),
-            decode: (data) => toUnits(contract.interface.decodeFunctionResult('voteTotals', data)[0])
-        };
+        const call = leafCall(contract, 'voteTotals', [proposalId], (r) => toUnits(r[0]));
         return resolveCall(call, batched);
     }
+
+    // DaoVoting.getVote, decoded: yesWeight and noWeight split the vote in basis points (10000 = all of it)
+    const decodeDaoVote = ([voted, yesWeight, noWeight, baseWeight, adjustedWeight]) => ({
+        voted,
+        yesWeight: toUnits(yesWeight, 0),
+        noWeight: toUnits(noWeight, 0),
+        baseWeight: toUnits(baseWeight),
+        adjustedWeight: toUnits(adjustedWeight)
+    });
 
     async function daoUserVote(platform = "Convex", proposalId, userAddress, batched = false) {
         validatePlatform(platform, "dao");
         const contract = contracts[`${platform}DaoVoting`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('getVote', [proposalId, userAddress]),
-            decode: (data) => {
-                const [voted, weight] = contract.interface.decodeFunctionResult('getVote', data);
-                return {
-                    voted,
-                    weight: toUnits(weight)
-                };
-            }
-        };
+        const call = leafCall(contract, 'getVote', [proposalId, userAddress], decodeDaoVote);
         return resolveCall(call, batched);
     }
 
     async function daoYesTotal(platform = "Convex", proposalId, batched = false) {
         validatePlatform(platform, "dao");
         const contract = contracts[`${platform}DaoVoting`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('getYes', [proposalId]),
-            decode: (data) => toUnits(contract.interface.decodeFunctionResult('getYes', data)[0])
-        };
+        const call = leafCall(contract, 'getYes', [proposalId], (r) => toUnits(r[0]));
         return resolveCall(call, batched);
     }
 
     async function daoNoTotal(platform = "Convex", proposalId, batched = false) {
         validatePlatform(platform, "dao");
         const contract = contracts[`${platform}DaoVoting`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('getNo', [proposalId]),
-            decode: (data) => toUnits(contract.interface.decodeFunctionResult('getNo', data)[0])
-        };
+        const call = leafCall(contract, 'getNo', [proposalId], (r) => toUnits(r[0]));
         return resolveCall(call, batched);
     }
 
     async function daoIsFinished(platform = "Convex", proposalId, batched = false) {
         validatePlatform(platform, "dao");
         const contract = contracts[`${platform}DaoVoting`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('isFinished', [proposalId]),
-            decode: (data) => contract.interface.decodeFunctionResult('isFinished', data)[0]
-        };
+        const call = leafCall(contract, 'isFinished', [proposalId], (r) => r[0]);
         return resolveCall(call, batched);
     }
 
     async function daoIsFinalized(platform = "Convex", proposalId, batched = false) {
         validatePlatform(platform, "dao");
         const contract = contracts[`${platform}DaoVoting`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('isFinalized', [proposalId]),
-            decode: (data) => contract.interface.decodeFunctionResult('isFinalized', data)[0]
-        };
+        const call = leafCall(contract, 'isFinalized', [proposalId], (r) => r[0]);
         return resolveCall(call, batched);
     }
 
@@ -669,36 +586,23 @@
             throw new Error('Invalid platform. Must be "Curve" or "Resupply".');
         }
         const contract = contracts[`${platform}VoteExecutor`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('isDone', [proposalId]),
-            decode: (data) => contract.interface.decodeFunctionResult('isDone', data)[0]
-        };
+        const call = leafCall(contract, 'isDone', [proposalId], (r) => r[0]);
         return resolveCall(call, batched);
     }
 
     async function daoVoterCount(platform = "Convex", proposalId, batched = false) {
         validatePlatform(platform, "dao");
         const contract = contracts[`${platform}DaoVoting`];
-        const call = {
-            target: contract.address,
-            callData: contract.interface.encodeFunctionData('getVoterCount', [proposalId]),
-            decode: (data) => contract.interface.decodeFunctionResult('getVoterCount', data)[0].toNumber()
-        };
+        const call = leafCall(contract, 'getVoterCount', [proposalId], (r) => r[0].toNumber());
         return resolveCall(call, batched);
     }
 
     async function daoAllVoterAddresses(platform = "Convex", proposalId, batched = false) {
         validatePlatform(platform, "dao");
         const count = await daoVoterCount(platform, proposalId);
-        console.log(`Proposal ${proposalId} has ${count} voters on ${platform}`);
         var groupedCalls = [];
         for (let i = 0; i < count; i++) {
-            groupedCalls.push({
-                target: contracts[`${platform}DaoVoting`].address,
-                callData: contracts[`${platform}DaoVoting`].interface.encodeFunctionData('getVoterAtIndex', [proposalId, i]),
-                decode: (data) => contracts[`${platform}DaoVoting`].interface.decodeFunctionResult('getVoterAtIndex', data)[0]
-            });
+            groupedCalls.push(leafCall(contracts[`${platform}DaoVoting`], 'getVoterAtIndex', [proposalId, i], (r) => r[0]));
         }
         // This can be dozens of calls, so always run it as its own self-contained
         // multicall rather than injecting the leaves into a parent batch (which could
@@ -709,24 +613,9 @@
     }
 
     async function daoAllVotes(platform = "Convex", proposalId, batched = false) {
-        console.log(`Fetching all votes for proposal ${proposalId} on ${platform}`);
         validatePlatform(platform, "dao");
         const voterAddresses = await daoAllVoterAddresses(platform, proposalId);
-        const groupedCalls = voterAddresses.map(userAddress => ({
-            target: contracts[`${platform}DaoVoting`].address,
-            callData: contracts[`${platform}DaoVoting`].interface.encodeFunctionData('getVote', [proposalId, userAddress]),
-            decode: (data) => {
-                const [voted, yesWeight, noWeight, baseWeight, adjustedWeight] = contracts[`${platform}DaoVoting`].interface.decodeFunctionResult('getVote', data);
-                return {
-                    userAddress,
-                    voted,
-                    yesWeight: toUnits(yesWeight, 0),
-                    noWeight: toUnits(noWeight, 0),
-                    baseWeight: toUnits(baseWeight),
-                    adjustedWeight: toUnits(adjustedWeight)
-                };
-            }
-        }));
+        const groupedCalls = voterAddresses.map(userAddress => leafCall(contracts[`${platform}DaoVoting`], 'getVote', [proposalId, userAddress], (r) => ({ userAddress, ...decodeDaoVote(r) })));
         // This can be hundreds of calls, so always run it as its own self-contained multicall rather than injecting the leaves into a parent batch (which could exceed RPC limits and revert/deny). To the outer batchCall it looks like a precomputed static value that occupies a single slot.
         const votes = await batchCall(groupedCalls);
         return batched ? staticValue(votes) : votes;
@@ -742,19 +631,11 @@
         }
         const contract = contracts[platform];
         if(platform === "CurveOwnership" || platform === "CurveParameter") {
-            const call = {
-                target: contract.address,
-                callData: contract.interface.encodeFunctionData('votesLength', []),
-                decode: (data) => toUnits(contract.interface.decodeFunctionResult('votesLength', data)[0], 0)
-            };
+            const call = leafCall(contract, 'votesLength', [], (r) => toUnits(r[0], 0));
             return resolveCall(call, batched);
         }
         if(platform === "ResupplyVoter") {
-            const call = {
-                target: contract.address,
-                callData: contract.interface.encodeFunctionData('getProposalCount', []),
-                decode: (data) => toUnits(contract.interface.decodeFunctionResult('getProposalCount', data)[0], 0)
-            };
+            const call = leafCall(contract, 'getProposalCount', [], (r) => toUnits(r[0], 0));
             return resolveCall(call, batched);
         }
         if(platform === "fxn.eth" || platform === "frax.eth") {
@@ -772,41 +653,27 @@
         }
         const contract = contracts[platform];
         if(platform === "CurveOwnership" || platform === "CurveParameter") {
-            const call = {
-                target: contract.address,
-                callData: contract.interface.encodeFunctionData('getVote', [proposalId]),
-                decode: (data) => {
-                    const [open, executed, startDate, snapshotBlock, supportRequired, minAcceptQuorum, yea, nay, votingPower, script] = contract.interface.decodeFunctionResult('getVote', data);
-                    return { 
-                        start: toUnits(startDate, 0),
-                        voteType: platform === "CurveOwnership" ? 0 : 1,
-                        cvxId: null,
-                        script: script
-                    };
-                }
-            };
+            const call = leafCall(contract, 'getVote', [proposalId], (r) => ({
+                start: toUnits(r.startDate, 0),
+                voteType: platform === "CurveOwnership" ? 0 : 1,
+                cvxId: null,
+                script: r.script
+            }));
             return resolveCall(call, batched);
         } else if(platform === "ResupplyVoter") {
-            const call = {
-                target: contract.address,
-                callData: contract.interface.encodeFunctionData('getProposalData', [proposalId]),
-                decode: (data) => {
-                    const [description, epoch, createdAt, quorumWeight, weightYes,weightNo,processed,executable,payload] = contract.interface.decodeFunctionResult('getProposalData', data);
-                    return { 
-                        description,
-                        start: toUnits(createdAt, 0),
-                        voteType: 0,
-                        cvxId: null,
-                        payload
-                    };
-                }
-            };
+            const call = leafCall(contract, 'getProposalData', [proposalId], (r) => ({
+                description: r.description,
+                start: toUnits(r.createdAt, 0),
+                voteType: 0,
+                cvxId: null,
+                payload: r.payload
+            }));
             return resolveCall(call, batched);
         } else if(platform === "fxn.eth" || platform === "frax.eth") {
             var proposals = await snapshot.getNewProposals(platform, proposalId);
             var formattedProposals = {};
             if(proposals.length == 0) {
-                return null;
+                return batched ? staticValue(null) : null;
             } else {
                 for(var i = 0; i < proposals.length; i++) {
                     // extract nativeId from title
@@ -822,7 +689,10 @@
                     } else {
                         nativeId = null;
                     }
-                    formattedProposals[nativeId] = {
+                    // keyed by FIP number, or by Snapshot id for a title without one (nativeId null), so none
+                    // overwrites another
+                    formattedProposals[nativeId !== null ? nativeId : proposals[i].id] = {
+                        nativeId,
                         snapshotId: proposals[i].id,
                         description: proposals[i].title,
                         start: proposals[i].start,
@@ -831,7 +701,7 @@
                     };
                 }
             }
-            return formattedProposals;
+            return batched ? staticValue(formattedProposals) : formattedProposals;
         } else {
             throw new Error(`Invalid platform. Must be one of: ${partnerDaoPlatforms.join(", ")}`);
         }
@@ -849,32 +719,35 @@
         } else {
             throw new Error(`Invalid type. Must be one of: 0 (CurveOwnership), 1 (CurveParameter)`);
         }
-        // use indexed event filter to get the StartVote event for the proposalId
-        // begin at latest block and search in batches of eventBlocksLimit blocks back until we find the event
-        // eventBlocksLimit and eventConcurrentLimit are already defined in the config
-        const latestBlock = await provider.getBlockNumber();
-        const filter = contract.filters.StartVote(proposalId);
-        var fromBlock = latestBlock - eventBlocksLimit;
-        if(fromBlock < 0) {
-            fromBlock = 0;
+        // The vote's record says where its StartVote event is: Aragon voting sets snapshotBlock to the block before
+        // the one that creates the vote. getVote reverts (VOTING_NO_VOTE) for a vote that doesn't exist.
+        const [snapshotBlock] = await batchCall([
+            leafCall(contract, 'getVote', [proposalId], (r) => r.snapshotBlock.toNumber(), { allowFailure: true })
+        ]);
+        if(snapshotBlock === null) {
+            throw new Error(`No vote ${proposalId} on ${type == 0 ? "CurveOwnership" : "CurveParameter"}`);
         }
-        var toBlock = latestBlock;
-        var events = [];
-        while(fromBlock <= latestBlock) {
-            events = await contract.queryFilter(filter, fromBlock, toBlock);
-            if(events.length > 0) {
-                break;
+        const filter = contract.filters.StartVote(proposalId);
+        var events = await contract.queryFilter(filter, snapshotBlock, snapshotBlock + 1);
+        // fallback, should the event not be there: windows of eventBlocksLimit blocks, newest first, from the latest
+        // block back to block 0
+        if(events.length == 0) {
+            var toBlock = await provider.getBlockNumber();
+            while(toBlock >= 0) {
+                const fromBlock = Math.max(0, toBlock - eventBlocksLimit + 1);
+                events = await contract.queryFilter(filter, fromBlock, toBlock);
+                if(events.length > 0) {
+                    break;
+                }
+                toBlock = fromBlock - 1;
             }
-            fromBlock = Math.max(0, fromBlock - eventBlocksLimit);
-            toBlock = fromBlock + eventBlocksLimit - 1;
         }
         if(events.length == 0) {
-            throw new Error(`No StartVote event found for proposalId ${proposalId} in the last ${eventBlocksLimit} blocks`);
+            throw new Error(`No StartVote event found for proposalId ${proposalId}`);
         }
         const metadata = events[0].args.metadata;
         // check if metadata is ipfs:// or ipns:// and if so, fetch the metadata from ipfs
         if(metadata.startsWith("ipfs:") || metadata.startsWith("ipns:")) {
-            console.log("Fetching metadata from IPFS for proposalId", proposalId);
             var ipfsHash = metadata.split(":")[1];
             // check if ipfsHash starts with // and remove it
             if(ipfsHash.startsWith("//")) {
@@ -893,10 +766,141 @@
         return batched ? staticValue(metadata) : metadata;
     }
 
+// GAUGE VOTE WEIGHTS (ported from the vlCVX voter)
+
+    async function userInfo(platform = "Curve", proposalId = "current", userAddress, batched = false) {
+        validatePlatform(platform, "gauge");
+        if(proposalId === "current") {
+            proposalId = gaugeProposalId();
+        }
+        const call = leafCall(contracts[`${platform}GaugeVoting`], 'userInfo', [proposalId, userAddress], (r) => ({
+            baseWeight: toUnits(r.baseWeight),
+            adjustedWeight: toUnits(r.adjustedWeight),
+            lastVoteSyncNonce: Number(r.lastVoteSyncNonce),
+            voteStatus: r.voteStatus,
+            delegate: r.delegate,
+            totalDelegationWeight: toUnits(r.totalDelegationWeight)
+        }));
+        return resolveCall(call, batched);
+    }
+
+    // The weight an account's next vote() on a proposal will carry, as { baseWeight, adjustedWeight }.
+    // Stored weights go stale mid-round (a delegator relocks and syncs, say), and the platform
+    // refreshes them on every vote: a first vote reads the base and delegated balances fresh on
+    // top of any adjustments already recorded, and a re-vote also applies pending adjustments.
+    async function predictVoteWeight(platform = "Curve", proposalId = "current", userAddress, batched = false) {
+        validatePlatform(platform, "gauge");
+        if(proposalId === "current") {
+            proposalId = gaugeProposalId();
+        }
+        const epoch = (await gaugeProposals(platform, proposalId)).epoch;
+        const [info, base, delegated, pending] = await batchCall([
+            userInfo(platform, proposalId, userAddress, true),
+            leafCall(contracts.vlCVX, 'balanceAtEpochOf', [epoch, userAddress], (r) => toUnits(r[0])),
+            leafCall(contracts.GaugeDelegation, 'balanceAtEpochOf', [epoch, userAddress], (r) => toUnits(r[0])),
+            leafCall(contracts[`${platform}GaugeVoting`], 'pendingWeightAdjustment', [proposalId, userAddress], (r) => toUnits(r[0]))
+        ]);
+        var weight;
+        if (info.delegate == ethers.constants.AddressZero) {
+            weight = { baseWeight: base, adjustedWeight: info.adjustedWeight + delegated };
+        } else if (info.voteStatus > 0) {
+            weight = { baseWeight: base, adjustedWeight: info.adjustedWeight + delegated - info.totalDelegationWeight + pending };
+        } else {
+            weight = { baseWeight: info.baseWeight, adjustedWeight: info.adjustedWeight };
+        }
+        return batched ? staticValue(weight) : weight;
+    }
+
+    // The weight each of `users` contributes to `delegate`'s vote, following
+    // GaugeVoteHelper.getContributingWeights. It depends on the delegate's own vote: weight a
+    // delegator syncs in (by relocking, say) only counts once the delegate votes again, and a
+    // delegator who voted manually only contributes what they synced in after their own vote.
+    // By default this predicts the delegate's next vote, which records the current delegation
+    // syncNonce. Pass delegateVote { voteStatus, lastVoteSyncNonce } to follow the helper for
+    // the delegate's vote as it stands instead.
+    async function predictContributingWeights(platform = "Curve", proposalId = "current", delegate, users, delegateVote = null, batched = false) {
+        validatePlatform(platform, "gauge");
+        if(proposalId === "current") {
+            proposalId = gaugeProposalId();
+        }
+        const epoch = (await gaugeProposals(platform, proposalId)).epoch;
+        const delegation = contracts.GaugeDelegation;
+        const voting = contracts[`${platform}GaugeVoting`];
+        // This can be hundreds of calls, so always run it as its own self-contained multicall. The delegation syncNonce
+        // goes last in the same batch, so it's read at the same block as the users.
+        const calls = users.map(user => groupCalls([
+            leafCall(delegation, 'getDelegateAtEpoch', [user, epoch], (r) => r[0]),
+            leafCall(delegation, 'userWeightAtEpochOf', [epoch, user], (r) => toUnits(r[0])),
+            leafCall(delegation, 'getSyncSnapshot', [user, epoch], (r) => ({ preSyncWeight: toUnits(r.preSyncWeight), snapNonce: r.snapshotNonce.toNumber() })),
+            leafCall(voting, 'userInfo', [proposalId, user], (r) => ({ voteStatus: r.voteStatus, lastVoteSyncNonce: Number(r.lastVoteSyncNonce) }))
+        ]));
+        if (delegateVote == null) {
+            calls.push(leafCall(delegation, 'syncNonce', [], (r) => r[0].toNumber()));
+        }
+        const perUser = await batchCall(calls);
+        if (delegateVote == null) {
+            delegateVote = { voteStatus: 1, lastVoteSyncNonce: perUser.pop() };
+        }
+        var weights = {};
+        users.forEach((user, i) => {
+            const [userDelegate, weight, snap, info] = perUser[i];
+            var contributed = 0;
+            if (userDelegate.toLowerCase() == delegate.toLowerCase()) {
+                if (info.voteStatus > 0) {
+                    if (snap.snapNonce > info.lastVoteSyncNonce && snap.snapNonce <= delegateVote.lastVoteSyncNonce && weight > snap.preSyncWeight) {
+                        contributed = weight - snap.preSyncWeight;
+                    }
+                } else if (delegateVote.voteStatus == 0 || snap.snapNonce == 0 || snap.snapNonce <= delegateVote.lastVoteSyncNonce) {
+                    contributed = weight;
+                } else {
+                    contributed = snap.preSyncWeight;
+                }
+            }
+            weights[user] = contributed;
+        });
+        return batched ? staticValue(weights) : weights;
+    }
+
+// GAUGE REGISTRY
+
+    // vote() reverts with NotGauge if any gauge isn't in the platform's gauge registry.
+    // Anyone can register a gauge with setGauge(address), but it only gets added if the
+    // gauge controller knows it and it isn't killed, and never if the owner force removed it.
+    // Returns { gauge: { registered, forceRemoved, addable } }.
+    async function gaugeRegistryStatus(platform = "Curve", gauges, batched = false) {
+        validatePlatform(platform, "gauge");
+        const contract = contracts[`${platform}GaugeRegistry`];
+        // isValidGauge reverts for addresses the gauge controller doesn't know: that means "not addable", and is
+        // allowed to fail without sinking the multicall. Any other error (the RPC failing, say) throws.
+        const groupedCalls = gauges.map(gauge => groupCalls([
+            leafCall(contract, 'isRegisteredGauge', [gauge], (r) => r[0]),
+            leafCall(contract, 'forceRemoved', [gauge], (r) => r[0]),
+            leafCall(contract, 'isValidGauge', [gauge], (r) => r[0], { allowFailure: true })
+        ], ([registered, forceRemoved, valid]) => ({ registered, forceRemoved, addable: !registered && !forceRemoved && valid === true })));
+        const statusRaw = await batchCall(groupedCalls);
+        var status = {};
+        gauges.forEach((gauge, i) => {
+            status[gauge] = statusRaw[i];
+        });
+        return batched ? staticValue(status) : status;
+    }
+
+    async function prepareSetGaugeTx(platform, gauge, signer) {
+        validatePlatform(platform, "gauge");
+        // setGauge is overloaded (gauge id / gauge address), so name the signature explicitly.
+        const tx = await contracts[`${platform}GaugeRegistry`].connect(signer).populateTransaction["setGauge(address)"](gauge);
+        return tx;
+    }
+
 // EXPORTS
 
-module.exports = {
+    return {
+    provider,
+    contracts,
     batchCall,
+    leafCall,
+    groupCalls,
+    staticValue,
     currentEpoch,
     gaugeProposalId,
     gaugeProposals,
@@ -938,5 +942,11 @@ module.exports = {
     snapshotGetNewProposals: snapshot.getNewProposals,
     snapshotGetVote: snapshot.getVote,
     snapshotHasVoted: snapshot.hasVoted,
-    getCurveMetadata
+    getCurveMetadata,
+    userInfo,
+    predictVoteWeight,
+    predictContributingWeights,
+    gaugeRegistryStatus,
+    prepareSetGaugeTx
+    };
 };

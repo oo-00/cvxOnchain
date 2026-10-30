@@ -1,0 +1,20 @@
+{
+  "name": "cvxonchain",
+  "version": "1.0.0",
+  "description": "Reads and unsigned transaction builders for Convex's on-chain vlCVX gauge and DAO voting, delegation and vlCVX balances",
+  "main": "cvxOnchain.js",
+  "files": [
+    "cvxOnchain.js",
+    "contracts.js",
+    "snapshot.js",
+    "abi/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ethers": "^5.4.7"
+  },
+  "license": "MIT",
+  "repository": "github:oo-00/cvxOnchain"
+}

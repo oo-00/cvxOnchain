@@ -1,4 +1,10 @@
-const cvxOnchain = require('./cvxOnchain');
+// options from settings.json (untracked: copy settings.example.json and put your RPC URL in it)
+const fs = require('fs');
+if (!fs.existsSync(__dirname + '/settings.json')) {
+    console.log('No settings.json: copy settings.example.json to settings.json and set your RPC URL there.');
+    process.exit(1);
+}
+const cvxOnchain = require('./cvxOnchain')(require('./settings.json'));
 
 var sleepTime = 500; // milliseconds for rpc limits
 
